@@ -1,0 +1,4 @@
+interface:
+  display_name: "FreeSql Docs"
+  short_description: "Fetch and convert FreeSql guide pages"
+  default_prompt: "Use $freesql-docs-skill to fetch the latest FreeSql guide page and return clean Markdown."
