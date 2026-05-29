@@ -60,6 +60,32 @@ SAMPLE_HTML = """
 </html>
 """
 
+SUMMARY_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>多表查询 ✨ | FreeSql</title>
+  </head>
+  <body>
+    <main id="main-content" class="vp-page">
+      <div class="vp-page-title">
+        <h1>多表查询 ✨</h1>
+      </div>
+      <p>说明 FreeSql 多表查询的核心写法与适用场景。</p>
+      <h2>1、多表 Join</h2>
+      <p>演示 LeftJoin、From 和结果投影。</p>
+      <h2>2、导航属性 Join</h2>
+      <h2>3、WithoutJoin</h2>
+      <h2>4、子表Exists</h2>
+      <h2>5、子表In</h2>
+      <h2>6、子表List导航属性</h2>
+      <h2>7、子表string.Join</h2>
+    </main>
+  </body>
+</html>
+"""
+
 
 class FreeSqlDocsTests(unittest.TestCase):
     def test_root_aliases_resolve_to_guide_index(self) -> None:
@@ -89,6 +115,36 @@ class FreeSqlDocsTests(unittest.TestCase):
             listing,
         )
         self.assertNotIn("其他作品", listing)
+
+    def test_page_summary_uses_live_page_headings(self) -> None:
+        summary = MODULE.build_page_summary_from_html(
+            SUMMARY_HTML,
+            "https://freesql.net/guide/select-multi-table.html",
+            max_chars=300,
+        )
+        self.assertIn("说明 FreeSql 多表查询的核心写法与适用场景。", summary)
+        self.assertIn("涵盖多表 Join、导航属性 Join、WithoutJoin、子表Exists", summary)
+        self.assertLessEqual(len(summary), 300)
+
+    def test_render_skill_guide_index_adds_summary_text(self) -> None:
+        block = MODULE.render_skill_guide_index(
+            {"insert": "涵盖单条插入、返回自增、批量插入与 BulkCopy。"},
+            summary_max_chars=300,
+        )
+        self.assertIn(MODULE.GUIDE_INDEX_START, block)
+        self.assertIn(
+            "- 插入: `https://freesql.net/guide/insert.html`  子功能：涵盖单条插入、返回自增、批量插入与 BulkCopy。",
+            block,
+        )
+
+    def test_replace_skill_guide_index_swaps_marked_block(self) -> None:
+        original = """---\nname: freesql-docs-skill\n---\n\n## Official Guide Categories\n\n<!-- GUIDE_INDEX_START -->\nold\n<!-- GUIDE_INDEX_END -->\n"""
+        updated = MODULE.replace_skill_guide_index(
+            original,
+            "## Official Guide Categories\n\n<!-- GUIDE_INDEX_START -->\nnew\n<!-- GUIDE_INDEX_END -->\n",
+        )
+        self.assertIn("new", updated)
+        self.assertNotIn("\nold\n", updated)
 
 
 if __name__ == "__main__":

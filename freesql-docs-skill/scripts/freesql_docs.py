@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import re
 import sys
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ SITE_ROOT = "https://freesql.net"
 GUIDE_ROOT = f"{SITE_ROOT}/guide/"
 USER_AGENT = "freesql-docs-skill/1.0"
 ROOT_SLUG_ALIASES = {"", "guide", "index", "readme", "root"}
+GUIDE_INDEX_START = "<!-- GUIDE_INDEX_START -->"
+GUIDE_INDEX_END = "<!-- GUIDE_INDEX_END -->"
 VOID_TAGS = {"br", "img", "hr", "meta", "link", "input"}
 SKIP_TAGS = {"script", "style"}
 SKIP_CLASSES = {
@@ -41,6 +44,10 @@ INLINE_TAGS = {
     "sub",
     "sup",
 }
+SUMMARY_HEADING_TAGS = {"h2", "h3", "h4"}
+SUMMARY_PREFIX_RE = re.compile(
+    r"^(?:第?[0-9一二三四五六七八九十百千]+[章节篇部分]\s*|[（(]?[0-9]+[)）]?\s*[、.．,:：)]?\s*)"
+)
 
 GUIDE_NAV = [
     {
@@ -381,6 +388,14 @@ def iter_nav_items() -> Iterable[dict[str, str]]:
 GUIDE_INDEX_BY_SLUG = {item["slug"]: item for item in iter_nav_items()}
 
 
+def iter_nav_entries() -> Iterable[tuple[str | None, dict[str, str]]]:
+    for entry in GUIDE_NAV:
+        if entry["type"] == "group":
+            yield entry["name"], entry
+            continue
+        yield None, entry
+
+
 def class_names(node: Node) -> set[str]:
     return {name for name in node.attrs.get("class", "").split() if name}
 
@@ -481,7 +496,11 @@ def should_skip(node: Node) -> bool:
     return node.attrs.get("aria-hidden") == "true" and "line-numbers" in classes
 
 
-def render_markdown_from_html(html: str, page_url: str) -> str:
+def is_title_container(node: Node) -> bool:
+    return node.tag == "div" and "vp-page-title" in class_names(node)
+
+
+def extract_main_content(html: str) -> Node:
     dom = build_dom(html)
     main = find_first(
         dom,
@@ -489,7 +508,11 @@ def render_markdown_from_html(html: str, page_url: str) -> str:
     )
     if not main:
         raise ValueError("Unable to find the guide main content block.")
+    return main
 
+
+def render_markdown_from_html(html: str, page_url: str) -> str:
+    main = extract_main_content(html)
     title = extract_title(html)
     updated = extract_last_updated(html)
     blocks = [f"# {title}", f"> Source: {page_url}"]
@@ -517,7 +540,7 @@ def render_block(node: Node) -> list[str]:
     if should_skip(node):
         return []
 
-    if node.tag == "div" and "vp-page-title" in class_names(node):
+    if is_title_container(node):
         return []
 
     if is_code_container(node):
@@ -568,6 +591,162 @@ def render_block(node: Node) -> list[str]:
         return ["---"]
 
     return []
+
+
+def walk_nodes(node: Node) -> Iterable[Node]:
+    if should_skip(node) or is_title_container(node):
+        return
+    yield node
+    for child in node.children:
+        if isinstance(child, Node):
+            yield from walk_nodes(child)
+
+
+def normalize_summary_text(text: str) -> str:
+    text = collapse_ws(text).strip()
+    text = SUMMARY_PREFIX_RE.sub("", text)
+    text = text.strip("  \t\r\n-:：,，;；.。")
+    return text
+
+
+def normalize_paragraph_summary_text(text: str) -> str:
+    text = collapse_ws(text).strip()
+    text = text.strip("  \t\r\n-")
+    return text
+
+
+def classify_markdown_block(block: str) -> str:
+    text = block.strip()
+    if not text:
+        return "empty"
+    if text.startswith("#"):
+        return "heading"
+    if text.startswith("```") or text.startswith("````"):
+        return "code"
+    lines = text.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("|") and re.match(r"^\|\s*[:\- ]+\|", lines[1]):
+        return "table"
+    if text.startswith(">"):
+        return "quote"
+    if re.match(r"^(?:- |\d+\. )", text):
+        return "list"
+    return "text"
+
+
+def trim_chars(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    trimmed = text[: max_chars - 1].rstrip("  \t\r\n,，;；:：")
+    return f"{trimmed}…"
+
+
+def extract_summary_headings(main: Node, title: str) -> list[str]:
+    headings: list[str] = []
+    seen: set[str] = set()
+    for node in walk_nodes(main):
+        if node.tag not in SUMMARY_HEADING_TAGS:
+            continue
+        text = normalize_summary_text(render_inline(node, heading_mode=True))
+        if not text or text == title or text in seen:
+            continue
+        seen.add(text)
+        headings.append(text)
+    return headings
+
+
+def extract_lead_paragraph(main: Node) -> str:
+    fallback = ""
+    skipped_initial_heading = False
+    for child in main.children:
+        if not isinstance(child, Node) or should_skip(child) or is_title_container(child):
+            continue
+        for block in render_block(child):
+            kind = classify_markdown_block(block)
+            if kind == "heading":
+                if not fallback and not skipped_initial_heading:
+                    skipped_initial_heading = True
+                    continue
+                return fallback
+            if kind == "text":
+                return normalize_paragraph_summary_text(block)
+            if not fallback and kind in {"quote", "list"}:
+                fallback = normalize_paragraph_summary_text(block)
+    return fallback
+
+
+def build_page_summary_from_html(html: str, page_url: str, max_chars: int = 300) -> str:
+    title = normalize_summary_text(extract_title(html))
+    main = extract_main_content(html)
+    headings = extract_summary_headings(main, title)
+    lead = extract_lead_paragraph(main)
+
+    clauses: list[str] = []
+    if lead:
+        clauses.append(trim_chars(lead, min(100, max_chars // 2)))
+
+    if headings:
+        feature_intro = "涵盖"
+        feature_suffix = "等内容。"
+        features: list[str] = []
+        for heading in headings:
+            joined = "、".join(features + [heading])
+            candidate_clauses = clauses[:]
+            candidate_clauses.append(f"{feature_intro}{joined}{feature_suffix}")
+            candidate = " ".join(candidate_clauses).strip()
+            if len(candidate) <= max_chars:
+                features.append(heading)
+                continue
+            break
+        if features:
+            clauses.append(f"{feature_intro}{'、'.join(features)}")
+            summary = " ".join(
+                (
+                    clause if clause.endswith(("。", "！", "？")) else f"{clause}。"
+                    if index == 0 and lead
+                    else clause
+                )
+                for index, clause in enumerate(clauses)
+            ).strip()
+            if not summary.endswith(("。", "！", "？")):
+                summary += "。"
+            return trim_chars(summary, max_chars)
+
+    if clauses:
+        summary = " ".join(clauses).strip()
+        if not summary.endswith(("。", "！", "？")):
+            summary += "。"
+        return trim_chars(summary, max_chars)
+
+    fallback = f"涵盖 {title} 的官方用法、示例与注意事项。".replace("  ", " ")
+    return trim_chars(fallback, max_chars)
+
+
+def build_page_summary(
+    item: dict[str, str],
+    *,
+    timeout: int = 30,
+    max_chars: int = 300,
+) -> str:
+    html = fetch_html(item["url"], timeout=timeout)
+    return build_page_summary_from_html(html, item["url"], max_chars=max_chars)
+
+
+def collect_page_summaries(
+    *,
+    timeout: int = 30,
+    max_chars: int = 300,
+    workers: int = 6,
+) -> dict[str, str]:
+    items = list(iter_nav_items())
+    if not items:
+        return {}
+
+    def summarize(item: dict[str, str]) -> tuple[str, str]:
+        return item["slug"], build_page_summary(item, timeout=timeout, max_chars=max_chars)
+
+    pool_size = max(1, min(workers, len(items)))
+    with ThreadPoolExecutor(max_workers=pool_size) as executor:
+        return dict(executor.map(summarize, items))
 
 
 def is_code_container(node: Node) -> bool:
@@ -764,6 +943,61 @@ def print_nav() -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def render_skill_guide_index(
+    summaries: dict[str, str] | None = None,
+    *,
+    summary_max_chars: int = 300,
+) -> str:
+    lines = ["## Official Guide Categories", "", GUIDE_INDEX_START]
+    summaries = summaries or {}
+
+    for group_name, entry in iter_nav_entries():
+        if entry["type"] == "group":
+            lines.append(f"### {group_name}")
+            lines.append("")
+            for item in entry["items"]:
+                summary = trim_chars(summaries.get(item["slug"], ""), summary_max_chars)
+                line = f"- {item['title']}: `{item['url']}`"
+                if summary:
+                    line += f"  子功能：{summary}"
+                lines.append(line)
+            lines.append("")
+            continue
+
+        summary = trim_chars(summaries.get(entry["slug"], ""), summary_max_chars)
+        line = f"### {entry['title']}\n\n- {entry['title']}: `{entry['url']}`"
+        if summary:
+            line += f"  子功能：{summary}"
+        lines.append(line)
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    lines.extend([GUIDE_INDEX_END, ""])
+    return "\n".join(lines)
+
+
+def replace_skill_guide_index(
+    skill_md: str,
+    guide_index_markdown: str,
+) -> str:
+    pattern = re.compile(
+        rf"{re.escape(GUIDE_INDEX_START)}.*?{re.escape(GUIDE_INDEX_END)}",
+        re.S,
+    )
+    replacement = "\n".join(
+        line for line in guide_index_markdown.splitlines() if line.strip() != "## Official Guide Categories"
+    ).strip()
+    if pattern.search(skill_md):
+        return pattern.sub(replacement, skill_md)
+
+    anchor = "## Official Guide Categories"
+    if anchor not in skill_md:
+        raise ValueError("Unable to find Official Guide Categories section in SKILL.md.")
+    before, _, after = skill_md.partition(anchor)
+    return f"{before}{guide_index_markdown.rstrip()}\n"
+
+
 def write_output(text: str, output: Path | None) -> None:
     if output:
         output.write_text(text, encoding="utf-8")
@@ -783,6 +1017,40 @@ def handle_fetch(args: argparse.Namespace) -> int:
     if args.max_lines:
         markdown = "\n".join(markdown.splitlines()[: args.max_lines]).rstrip() + "\n"
     write_output(markdown, args.output)
+    return 0
+
+
+def handle_summarize(args: argparse.Namespace) -> int:
+    if args.slug:
+        item = GUIDE_INDEX_BY_SLUG.get(normalize_slug(args.slug))
+        if not item:
+            supported = ", ".join(sorted(format_slug(value["slug"]) for value in iter_nav_items()))
+            raise ValueError(f"Unknown guide slug: {args.slug}. Supported slugs: {supported}")
+        text = build_page_summary(item, timeout=args.timeout, max_chars=args.max_chars) + "\n"
+        write_output(text, args.output)
+        return 0
+
+    summaries = collect_page_summaries(
+        timeout=args.timeout,
+        max_chars=args.max_chars,
+        workers=args.workers,
+    )
+    guide_index = render_skill_guide_index(summaries, summary_max_chars=args.max_chars)
+    write_output(guide_index, args.output)
+    return 0
+
+
+def handle_update_skill_md(args: argparse.Namespace) -> int:
+    skill_path = args.skill_md or Path(__file__).resolve().parents[1] / "SKILL.md"
+    skill_md = skill_path.read_text(encoding="utf-8")
+    summaries = collect_page_summaries(
+        timeout=args.timeout,
+        max_chars=args.max_chars,
+        workers=args.workers,
+    )
+    guide_index = render_skill_guide_index(summaries, summary_max_chars=args.max_chars)
+    updated = replace_skill_guide_index(skill_md, guide_index)
+    write_output(updated, args.output or skill_path)
     return 0
 
 
@@ -807,6 +1075,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fetch_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
     fetch_parser.set_defaults(handler=handle_fetch)
+
+    summarize_parser = subparsers.add_parser(
+        "summarize",
+        help="Generate live-content summaries for guide pages or the SKILL.md guide index block.",
+    )
+    summarize_parser.add_argument("--slug", help="Summarize one guide slug only.")
+    summarize_parser.add_argument("--output", type=Path, help="Write output to a file instead of stdout.")
+    summarize_parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=300,
+        help="Maximum characters per generated page summary.",
+    )
+    summarize_parser.add_argument("--workers", type=int, default=6, help="Parallel fetch workers.")
+    summarize_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
+    summarize_parser.set_defaults(handler=handle_summarize)
+
+    update_parser = subparsers.add_parser(
+        "update-skill-md",
+        help="Refresh the Official Guide Categories block inside SKILL.md using live guide summaries.",
+    )
+    update_parser.add_argument("--skill-md", type=Path, help="Path to the target SKILL.md file.")
+    update_parser.add_argument("--output", type=Path, help="Write updated SKILL.md to a different file.")
+    update_parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=300,
+        help="Maximum characters per generated page summary.",
+    )
+    update_parser.add_argument("--workers", type=int, default=6, help="Parallel fetch workers.")
+    update_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
+    update_parser.set_defaults(handler=handle_update_skill_md)
     return parser
 
 
